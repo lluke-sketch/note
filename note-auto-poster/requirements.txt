@@ -1,0 +1,6 @@
+anthropic
+feedparser
+requests
+notion-client
+python-dotenv
+martian
