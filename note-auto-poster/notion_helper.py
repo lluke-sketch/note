@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from notion_client import Client
@@ -11,7 +11,7 @@ try:
 except ImportError:
     _MARTIAN_AVAILABLE = False
 
-from config import NOTION_API_KEY, NOTION_DATABASE_ID
+from config import NOTION_API_KEY, NOTION_PAGE_ID
 
 logger = logging.getLogger(__name__)
 
@@ -40,40 +40,6 @@ def _extract_title(article: str) -> str:
         if stripped.startswith("# "):
             return stripped[2:].strip()
     return f"記事 {date.today().isoformat()}"
-
-
-def _extract_source_urls(article: str) -> list[str]:
-    """「参照ソース / 元ソース / References」セクション内の URL を収集する。"""
-    urls: list[str] = []
-    in_section = False
-    section_re = re.compile(r'^#{1,3}\s*(参照ソース|元ソース|References|参考リンク)', re.IGNORECASE)
-    next_section_re = re.compile(r'^#{1,3}\s+')
-    url_re = re.compile(r'https?://[^\s\)>]+')
-
-    for line in article.splitlines():
-        stripped = line.strip()
-        if section_re.match(stripped):
-            in_section = True
-            continue
-        if in_section:
-            # 次のセクション見出しに入ったら終了
-            if next_section_re.match(stripped) and not section_re.match(stripped):
-                break
-            m = url_re.search(stripped)
-            if m:
-                urls.append(m.group())
-
-    return urls
-
-
-def _extract_hashtags(article: str) -> str:
-    """末尾付近の「#タグ #タグ」形式の行を返す。見つからなければ空文字。"""
-    hashtag_line_re = re.compile(r'^(#[^\s#]+)(\s+#[^\s#]+)*\s*$')
-    for line in reversed(article.splitlines()):
-        stripped = line.strip()
-        if hashtag_line_re.match(stripped):
-            return stripped
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -174,188 +140,61 @@ def _fallback_to_blocks(markdown: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# パブリック API
+# 内部ヘルパー
 # ---------------------------------------------------------------------------
 
-def get_page_url(page_id: str) -> str:
-    """Notion ページ ID からブラウザで開ける URL を返す。
+def _list_child_pages(client: Client) -> list[dict[str, Any]]:
+    """親ページ直下の child_page ブロック一覧をすべて返す。"""
+    if not NOTION_PAGE_ID:
+        return []
 
-    Args:
-        page_id: Notion ページ ID（ハイフンあり・なし両対応）
-
-    Returns:
-        str: notion.so 形式のページ URL
-    """
-    return f"{_NOTION_BASE_URL}/{page_id.replace('-', '')}"
-
-
-def save_draft(
-    article: str,
-    title: str = "",
-    source_urls: list[str] | None = None,
-    hashtags: str = "",
-) -> str:
-    """Notion データベースに記事を下書きとして保存し、ページ URL を返す。
-
-    プロパティ:
-        - title (title): 記事タイトル
-        - ステータス (select): "下書き"
-        - 生成日 (date): 今日の日付
-        - 元ソース (rich_text): 参照 URL をカンマ区切り
-        - ハッシュタグ (rich_text): ハッシュタグ文字列
-
-    ページ本文は Markdown を Notion ブロックに変換して挿入する。
-    Notion の 100 ブロック/リクエスト制限に対応するため分割して送信する。
-
-    Args:
-        article: Markdown 形式の記事文字列
-        title: 記事タイトル（省略時は article の最初の # 見出しから抽出）
-        source_urls: 参照 URL リスト（省略時は article から抽出）
-        hashtags: ハッシュタグ文字列（省略時は article から抽出）
-
-    Returns:
-        str: 作成された Notion ページの URL
-    """
-    client = _get_client()
-
-    if not title:
-        title = _extract_title(article)
-    if source_urls is None:
-        source_urls = _extract_source_urls(article)
-    if not hashtags:
-        hashtags = _extract_hashtags(article)
-
-    page = client.pages.create(
-        parent={"database_id": NOTION_DATABASE_ID},
-        properties={
-            "title": {
-                "title": [{"type": "text", "text": {"content": title}}]
-            },
-            "ステータス": {
-                "select": {"name": "下書き"}
-            },
-            "生成日": {
-                "date": {"start": date.today().isoformat()}
-            },
-            "元ソース": {
-                "rich_text": [{"type": "text", "text": {"content": ", ".join(source_urls)}}]
-            },
-            "ハッシュタグ": {
-                "rich_text": [{"type": "text", "text": {"content": hashtags}}]
-            },
-        },
-    )
-
-    page_id: str = page["id"]
-
-    blocks = markdown_to_blocks(article)
-    for i in range(0, len(blocks), _BLOCKS_PER_REQUEST):
-        client.blocks.children.append(
-            block_id=page_id,
-            children=blocks[i : i + _BLOCKS_PER_REQUEST],
-        )
-
-    logger.info(f"Notion ページ作成完了: {page_id} ({len(blocks)} ブロック)")
-    return get_page_url(page_id)
-
-
-def get_recent_urls(days: int = 7) -> list[str]:
-    """過去 N 日間に保存した記事の元ソース URL リストを返す（重複なし）。
-
-    Args:
-        days: 遡る日数（デフォルト: 7）
-
-    Returns:
-        list[str]: 元ソース URL リスト
-    """
-    client = _get_client()
-    since = (date.today() - timedelta(days=days)).isoformat()
-
-    pages: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     cursor: str | None = None
 
     while True:
-        kwargs: dict[str, Any] = {
-            "database_id": NOTION_DATABASE_ID,
-            "filter": {"property": "生成日", "date": {"on_or_after": since}},
-            "page_size": 100,
-        }
+        kwargs: dict[str, Any] = {"block_id": NOTION_PAGE_ID, "page_size": 100}
         if cursor:
             kwargs["start_cursor"] = cursor
 
-        resp = client.databases.query(**kwargs)
-        pages.extend(resp.get("results", []))
+        resp = client.blocks.children.list(**kwargs)
+        for block in resp.get("results", []):
+            if block.get("type") == "child_page":
+                results.append(block)
 
         if not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
 
-    seen: set[str] = set()
-    urls: list[str] = []
-    for page in pages:
-        raw = (
-            page.get("properties", {})
-            .get("元ソース", {})
-            .get("rich_text", [{}])[0]
-            .get("text", {})
-            .get("content", "")
-        )
-        for url in raw.split(","):
-            url = url.strip()
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-
-    return urls
+    return results
 
 
-def get_recent_articles(count: int = 3) -> list[dict[str, Any]]:
-    """直近 N 件の記事を取得する。「投稿済」を優先し、不足分を「下書き」で補完する。
+def _get_page_created_time(client: Client, page_id: str) -> datetime | None:
+    """ページの作成日時を UTC aware datetime で返す。取得失敗時は None。"""
+    try:
+        page = client.pages.retrieve(page_id)
+        created_str: str = page.get("created_time", "")
+        if created_str:
+            return datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+    except Exception as e:
+        logger.warning(f"ページ作成日時取得失敗 ({page_id}): {e}")
+    return None
 
-    Args:
-        count: 取得件数（デフォルト: 3）
 
-    Returns:
-        list[dict]: 各要素は {"title": str, "url": str, "body": str, "status": str}
+def _extract_urls_from_blocks(blocks: list[dict[str, Any]]) -> list[str]:
+    """Notion ブロックの rich_text から href を収集して URL リストを返す。
+
+    Notion は Markdown リンク [text](url) を rich_text オブジェクトの
+    href フィールドに URL を持つ形式で保存する。
     """
-    client = _get_client()
-
-    posted = _query_by_status(client, "投稿済", count)
-    remaining = count - len(posted)
-    drafts = _query_by_status(client, "下書き", remaining) if remaining > 0 else []
-    pages = (posted + drafts)[:count]
-
-    articles = []
-    for page in pages:
-        page_id: str = page["id"]
-
-        title_items = page.get("properties", {}).get("title", {}).get("title", [])
-        title = title_items[0].get("text", {}).get("content", "") if title_items else ""
-
-        select = page.get("properties", {}).get("ステータス", {}).get("select") or {}
-        status = select.get("name", "")
-
-        articles.append({
-            "title": title,
-            "url": get_page_url(page_id),
-            "body": _fetch_body(client, page_id),
-            "status": status,
-        })
-
-    return articles
-
-
-def _query_by_status(client: Client, status: str, limit: int) -> list[dict[str, Any]]:
-    """指定ステータスのページを新しい順に最大 limit 件取得する。"""
-    if limit <= 0:
-        return []
-    resp = client.databases.query(
-        database_id=NOTION_DATABASE_ID,
-        filter={"property": "ステータス", "select": {"equals": status}},
-        sorts=[{"property": "生成日", "direction": "descending"}],
-        page_size=min(limit, 100),
-    )
-    return resp.get("results", [])[:limit]
+    urls: list[str] = []
+    for block in blocks:
+        btype = block.get("type", "")
+        for rt in block.get(btype, {}).get("rich_text", []):
+            # href はトップレベルに置かれる場合と text.link.url に置かれる場合がある
+            href = rt.get("href") or (rt.get("text", {}).get("link") or {}).get("url", "")
+            if href and isinstance(href, str):
+                urls.append(href)
+    return urls
 
 
 def _fetch_body(client: Client, page_id: str) -> str:
@@ -378,3 +217,137 @@ def _block_to_text(block: dict[str, Any]) -> str:
     btype = block.get("type", "")
     rich_texts = block.get(btype, {}).get("rich_text", [])
     return "".join(rt.get("plain_text", "") for rt in rich_texts)
+
+
+# ---------------------------------------------------------------------------
+# パブリック API
+# ---------------------------------------------------------------------------
+
+def get_page_url(page_id: str) -> str:
+    """Notion ページ ID からブラウザで開ける URL を返す。
+
+    Args:
+        page_id: Notion ページ ID（ハイフンあり・なし両対応）
+
+    Returns:
+        str: notion.so 形式のページ URL
+    """
+    return f"{_NOTION_BASE_URL}/{page_id.replace('-', '')}"
+
+
+def save_draft(article: str, title: str = "") -> str:
+    """親ページのサブページとして記事を保存し、ページ URL を返す。
+
+    pages.create の children パラメータで最初の 100 ブロックを一括送信する。
+    100 ブロックを超える場合は blocks.children.append で追加する。
+
+    Args:
+        article: Markdown 形式の記事文字列
+        title: ページタイトル（省略時は article の最初の # 見出しから抽出）
+
+    Returns:
+        str: 作成された Notion ページの URL
+    """
+    client = _get_client()
+    if not NOTION_PAGE_ID:
+        raise ValueError("NOTION_PAGE_ID が設定されていません")
+
+    if not title:
+        title = _extract_title(article)
+
+    blocks = markdown_to_blocks(article)
+    first_chunk = blocks[:_BLOCKS_PER_REQUEST]
+    remaining = blocks[_BLOCKS_PER_REQUEST:]
+
+    page = client.pages.create(
+        parent={"page_id": NOTION_PAGE_ID},
+        properties={
+            "title": {
+                "title": [{"type": "text", "text": {"content": title}}]
+            }
+        },
+        children=first_chunk,
+    )
+
+    page_id: str = page["id"]
+
+    for i in range(0, len(remaining), _BLOCKS_PER_REQUEST):
+        client.blocks.children.append(
+            block_id=page_id,
+            children=remaining[i : i + _BLOCKS_PER_REQUEST],
+        )
+
+    logger.info(f"Notion サブページ作成完了: {page_id} ({len(blocks)} ブロック)")
+    return get_page_url(page_id)
+
+
+def get_recent_urls(days: int = 7) -> list[str]:
+    """過去 N 日間に保存したサブページの元記事 URL リストを返す（重複なし）。
+
+    各サブページのブロックを取得し、rich_text の href から URL を収集する。
+
+    Args:
+        days: 遡る日数（デフォルト: 7）
+
+    Returns:
+        list[str]: URL リスト
+    """
+    client = _get_client()
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+
+    child_pages = _list_child_pages(client)
+
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    for block in child_pages:
+        page_id: str = block["id"]
+
+        created = _get_page_created_time(client, page_id)
+        if created is not None and created < cutoff:
+            continue
+
+        try:
+            resp = client.blocks.children.list(block_id=page_id, page_size=100)
+            for url in _extract_urls_from_blocks(resp.get("results", [])):
+                if url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+        except Exception as e:
+            logger.warning(f"ブロック取得失敗 ({page_id}): {e}")
+
+    logger.info(f"過去 {days} 日間の投稿済み URL: {len(urls)} 件")
+    return urls
+
+
+def get_recent_articles(count: int = 3) -> list[dict[str, Any]]:
+    """直近 N 件のサブページを作成日時降順で取得する。
+
+    Args:
+        count: 取得件数（デフォルト: 3）
+
+    Returns:
+        list[dict]: 各要素は {"title": str, "url": str, "body": str}
+    """
+    client = _get_client()
+    child_pages = _list_child_pages(client)
+
+    # 各ページの作成日時を取得してソート
+    pages_with_time: list[tuple[datetime, dict[str, Any]]] = []
+    for block in child_pages:
+        created = _get_page_created_time(client, block["id"])
+        if created is not None:
+            pages_with_time.append((created, block))
+
+    pages_with_time.sort(key=lambda t: t[0], reverse=True)
+
+    articles = []
+    for _, block in pages_with_time[:count]:
+        page_id: str = block["id"]
+        articles.append({
+            "title": block.get("child_page", {}).get("title", ""),
+            "url": get_page_url(page_id),
+            "body": _fetch_body(client, page_id),
+        })
+
+    return articles

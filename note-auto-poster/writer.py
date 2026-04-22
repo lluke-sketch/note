@@ -9,7 +9,7 @@ from config import ANTHROPIC_API_KEY
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "claude-sonnet-4-20250514"
+_MODEL = "claude-sonnet-4-5"
 
 # プロンプトキャッシュ対象（Sonnet は 1024 トークン以上で有効）
 _SYSTEM_PROMPT = """\
@@ -70,7 +70,8 @@ def build_prompt(filtered_news: list[dict[str, Any]]) -> str:
     Returns:
         str: Claude API の user メッセージ文字列
     """
-    today = date.today().strftime("%Y年%-m月%-d日")
+    d = date.today()
+    today = f"{d.year}年{d.month}月{d.day}日"
     lines: list[str] = [
         f"今日の日付: {today}",
         f"記事数: {len(filtered_news)}件",

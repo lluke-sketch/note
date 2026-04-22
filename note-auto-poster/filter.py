@@ -166,7 +166,7 @@ def score_with_claude(news_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
     raw = response.content[0].text
-    logger.debug(f"Claude レスポンス (先頭200字): {raw[:200]}")
+    logger.info(f"Claude レスポンス (先頭300字): {raw[:300]}")
 
     scores = _parse_score_response(raw, len(news_list))
 
@@ -191,16 +191,20 @@ def score_with_claude(news_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _parse_score_response(raw: str, expected_count: int) -> list[dict[str, Any]]:
     """Claude のレスポンスから JSON 配列を抽出してパースする。
 
-    コードフェンスや前後のテキストが含まれていても対応できるよう
-    正規表現でブラケット部分だけを取り出す。
+    コードフェンス行（``` で始まる行）を行単位で除去してから
+    JSON 配列部分を探す。ペアマッチ方式より確実に動作する。
     """
-    # コードフェンスを除去
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
+    # ``` で始まる行をすべて除去（```json, ``` 両方対応）
+    cleaned_lines = [
+        line for line in raw.splitlines()
+        if not line.strip().startswith("```")
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
 
-    # 配列部分を抽出（最初の [ から対応する ] まで）
-    m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    # JSON 配列 [...] を抽出
+    m = re.search(r"\[[\s\S]*\]", cleaned)
     if not m:
-        logger.error(f"JSON 配列が見つかりません。フォールバックスコアを使用: {raw[:200]}")
+        logger.error(f"JSON 配列が見つかりません。レスポンス全文:\n{raw}")
         return []
 
     try:
@@ -209,5 +213,5 @@ def _parse_score_response(raw: str, expected_count: int) -> list[dict[str, Any]]
             raise ValueError("レスポンスがリスト形式ではありません")
         return parsed
     except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"JSON パース失敗: {e} / 入力: {m.group()[:200]}")
+        logger.error(f"JSON パース失敗: {e}\nJSON候補:\n{m.group()}")
         return []
