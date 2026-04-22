@@ -13,5 +13,5 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FEEDS: list[str] = [
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
-    "https://www.rss.reuters.com/news/technology",
+    "https://feeds.reuters.com/reuters/technologyNews",
 ]

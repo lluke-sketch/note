@@ -154,7 +154,7 @@ def score_with_claude(news_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     response = client.messages.create(
         model=_MODEL,
-        max_tokens=1024,
+        max_tokens=4096,
         system=[
             {
                 "type": "text",
