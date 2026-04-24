@@ -1,0 +1,10 @@
+# Environment / secrets
+note-auto-poster/.env
+note-auto-poster/.env note.txt
+note-auto-poster/*.env
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Misc text files that may contain sensitive data
+note-auto-poster/mntcUsersllukeDocumentsInformationI.txt
