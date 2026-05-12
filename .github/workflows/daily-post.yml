@@ -1,8 +1,8 @@
 name: Daily Note Auto Post
 
 on:
-  schedule:
-    - cron: "0 22 * * *"  # UTC 22:00 = JST 07:00
+  # schedule:
+  #   - cron: "0 22 * * *"  # UTC 22:00 = JST 07:00
   workflow_dispatch:
 
 jobs:
